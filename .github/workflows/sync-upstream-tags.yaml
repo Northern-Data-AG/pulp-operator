@@ -1,0 +1,92 @@
+name: Sync upstream tags
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_REPO: pulp/pulp-operator
+  UPSTREAM_BRANCH: main
+  FORK_BRANCH: main
+  TAG_PREFIX: fork-
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ssh-key: ${{ secrets.ACTIONS_DEPLOY_KEY }}
+
+      - name: Configure git
+        run: |
+          git config user.name "fork-sync-bot"
+          git config user.email "fork-sync-bot@users.noreply.github.com"
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+      - name: Set origin to SSH
+        run: |
+          git remote set-url origin \
+            git@github.com:${{ github.repository }}.git
+
+      - name: Add and fetch upstream
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch upstream "${UPSTREAM_BRANCH}" --tags
+          git fetch origin "${FORK_BRANCH}" --tags
+
+      - name: Find newest unprocessed upstream semver tag on upstream/main
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag="$(
+            git tag --merged "upstream/${UPSTREAM_BRANCH}" \
+              | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -V \
+              | while read -r t; do
+                  if ! git rev-parse -q --verify "refs/tags/${TAG_PREFIX}${t}" >/dev/null; then
+                    echo "$t"
+                  fi
+                done \
+              | tail -n 1
+          )"
+
+          if [ -z "$tag" ]; then
+            echo "No new upstream tag found."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Found upstream tag: $tag"
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+            echo "fork_tag=${TAG_PREFIX}${tag}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge upstream tag into fork main
+        if: steps.tag.outputs.found == 'true'
+        run: |
+          git checkout "${FORK_BRANCH}"
+          git reset --hard "origin/${FORK_BRANCH}"
+
+          git merge --no-ff "refs/tags/${{ steps.tag.outputs.tag }}" \
+            -m "Merge upstream tag ${{ steps.tag.outputs.tag }}"
+
+          git tag -a "${{ steps.tag.outputs.fork_tag }}" \
+            -m "Fork release for upstream ${{ steps.tag.outputs.tag }}"
+
+      - name: Push fork branch and tag
+        if: steps.tag.outputs.found == 'true'
+        run: |
+          git push origin "HEAD:${FORK_BRANCH}"
+          git push origin "refs/tags/${{ steps.tag.outputs.fork_tag }}"
