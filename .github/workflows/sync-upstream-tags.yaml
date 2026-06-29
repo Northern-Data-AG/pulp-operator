@@ -51,11 +51,24 @@ jobs:
         run: |
           set -euo pipefail
 
+          latest_processed="$(
+            git tag -l "${TAG_PREFIX}*" \
+              | sed "s/^${TAG_PREFIX}//" \
+              | awk '/^[0-9]+\.[0-9]+\.[0-9]+$/' \
+              | sort -V \
+              | tail -n 1
+          )"
+
           tag="$(
             git tag --merged "upstream/${UPSTREAM_BRANCH}" \
               | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
               | sort -V \
               | while read -r t; do
+                  if [ -n "$latest_processed" ] &&
+                     [ "$(printf '%s\n%s\n' "$latest_processed" "$t" | sort -V | tail -n 1)" = "$latest_processed" ]; then
+                    continue
+                  fi
+
                   if ! git rev-parse -q --verify "refs/tags/${TAG_PREFIX}${t}" >/dev/null; then
                     echo "$t"
                   fi
