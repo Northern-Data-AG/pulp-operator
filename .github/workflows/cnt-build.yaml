@@ -1,0 +1,151 @@
+name: Container Image Build
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "fork-*"
+  workflow_dispatch:
+
+concurrency:
+  group: pulp-operator-image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_NAME: harbor.tyr.taigacloud.tech/taiga/pulp-operator
+
+jobs:
+  build:
+    if: |
+      github.ref_type == 'tag' ||
+      (
+        github.ref_type == 'branch' &&
+        !startsWith(github.event.head_commit.message, 'Merge upstream tag ')
+      )
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: checkout repo
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Login to our own container registry
+        uses: docker/login-action@v4
+        with:
+          registry: harbor.tyr.taigacloud.tech
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Prepare build inputs
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          short_sha="$(git rev-parse --short=12 HEAD)"
+
+          version="$(
+            git tag --list 'fork-[0-9]*.[0-9]*.[0-9]*' \
+            | sed -E 's/^fork-//' \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -V \
+            | tail -n1
+          )"
+
+          if [[ -z "${version}" ]]; then
+            echo "Failed to resolve latest local fork-* semver tag" >&2
+            exit 1
+          fi
+
+          if [[ ! "${version}" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "Latest fork tag is not a plain x.y.z semver: ${version}" >&2
+            exit 1
+          fi
+
+          major="${BASH_REMATCH[1]}"
+          minor="${BASH_REMATCH[2]}"
+          patch="${BASH_REMATCH[3]}"
+
+          tag_full="${major}.${minor}.${patch}"
+          tag_minor="${major}.${minor}"
+          tag_major="${major}"
+          git_tag="fork-${tag_full}"
+
+          echo "Checking out latest fork semver tag: ${git_tag}"
+          git checkout --detach "${git_tag}"
+
+          force_build=false
+          if [[ "${GITHUB_EVENT_NAME}" == "push" || "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            force_build=true
+          fi
+
+          image_ref="${IMAGE_NAME}:${tag_full}"
+          image_exists=false
+          if docker buildx imagetools inspect "${image_ref}" >/dev/null 2>&1; then
+            image_exists=true
+          fi
+
+          should_build=false
+          if [[ "${force_build}" == "true" || "${image_exists}" != "true" ]]; then
+            should_build=true
+          fi
+
+          platforms="linux/amd64,linux/arm64"
+
+          cat >> "${GITHUB_OUTPUT}" <<EOF
+          version=${tag_full}
+          tag_minor=${tag_minor}
+          tag_major=${tag_major}
+          platforms=${platforms}
+          exists=${image_exists}
+          should_build=${should_build}
+          force_build=${force_build}
+          run_short_sha=${short_sha}
+          tags<<EOT
+          ${IMAGE_NAME}:${tag_full}-${short_sha}
+          ${IMAGE_NAME}:${tag_full}
+          ${IMAGE_NAME}:${tag_minor}
+          ${IMAGE_NAME}:${tag_major}
+          EOT
+          EOF
+
+      - name: Build and push
+        if: steps.prep.outputs.should_build == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          pull: true
+          push: true
+          platforms: ${{ steps.prep.outputs.platforms }}
+          tags: ${{ steps.prep.outputs.tags }}
+
+      - name: Summary
+        shell: bash
+        run: |
+          cat >> "${GITHUB_STEP_SUMMARY}" <<EOF
+          ## pulp-operator image build
+
+          - Upstream version: \`${{ steps.prep.outputs.version }}\`
+          - Image: \`${{ env.IMAGE_NAME }}\`
+          - Tags:"
+              - \`${{ env.IMAGE_NAME }}:${{ steps.prep.outputs.version }}-${{ steps.prep.outputs.run_short_sha }}\`
+              - \`${{ env.IMAGE_NAME }}:${{ steps.prep.outputs.version }}\`
+              - \`${{ env.IMAGE_NAME }}:${{ steps.prep.outputs.tag_minor }}\`
+              - \`${{ env.IMAGE_NAME }}:${{ steps.prep.outputs.tag_major }}\`
+          - Platforms: \`${{ steps.prep.outputs.platforms }}\`
+          - Force build: \`${{ steps.prep.outputs.force_build }}\`
+          - Existing full tag already present: \`${{ steps.prep.outputs.exists }}\`
+          - Build executed: \`${{ steps.prep.outputs.should_build }}\`
+          EOF
+
